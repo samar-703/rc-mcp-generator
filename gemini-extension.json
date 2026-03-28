@@ -1,0 +1,14 @@
+{
+  "name": "rc-mcp-generator",
+  "version": "1.0.0",
+  "contextFileName": "GEMINI.md",
+  "mcpServers": {
+    "rc-mcp-generator": {
+      "command": "node",
+      "args": [
+        "${extensionPath}${/}packages${/}generator${/}dist${/}extension-server.js"
+      ],
+      "cwd": "${extensionPath}"
+    }
+  }
+}
