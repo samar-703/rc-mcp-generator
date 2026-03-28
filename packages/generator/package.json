@@ -13,18 +13,22 @@
     "src"
   ],
   "scripts": {
-    "build": "tsup src/cli.ts src/generator.ts src/gemini-extension/index.ts --format esm --dts --clean",
+    "build": "tsup src/cli.ts src/generator.ts src/extension-server.ts --format esm --dts --clean",
     "clean": "rm -rf dist coverage",
-    "dev": "tsx src/cli.ts",
+    "dev": "tsx src/extension-server.ts",
+    "dev:cli": "tsx src/cli.ts",
     "lint": "eslint src --ext .ts",
-    "test": "vitest run --passWithNoTests",
+    "test": "vitest run",
     "typecheck": "tsc --project tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@apidevtools/swagger-parser": "^12.1.0",
     "@inquirer/prompts": "^7.8.4",
+    "@modelcontextprotocol/sdk": "^1.27.1",
     "chalk": "^5.6.2",
     "commander": "^14.0.1",
     "fs-extra": "^11.3.1",
-    "handlebars": "^4.7.8"
+    "handlebars": "^4.7.8",
+    "zod": "^4.1.5"
   }
 }

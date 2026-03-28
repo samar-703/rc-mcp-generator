@@ -8,6 +8,7 @@
     "build": "pnpm -r build",
     "clean": "pnpm -r clean",
     "dev": "pnpm --filter @rc-mcp-generator/generator dev",
+    "dev:cli": "pnpm --filter @rc-mcp-generator/generator dev:cli",
     "lint": "pnpm -r lint",
     "test": "pnpm -r test",
     "typecheck": "pnpm -r typecheck"
