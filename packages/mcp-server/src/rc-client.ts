@@ -233,6 +233,17 @@ export class RocketChatClient {
     });
   }
 
+  public async callApi<TSchema extends z.ZodTypeAny>(
+    config: AxiosRequestConfig,
+    schema: TSchema,
+  ): Promise<z.infer<TSchema>> {
+    try {
+      return await this.request(config, schema);
+    } catch (error) {
+      throw this.toRocketChatError(error, config.url ?? 'unknown-endpoint');
+    }
+  }
+
   public async sendMessage(input: {
     alias?: string;
     channel?: string;
