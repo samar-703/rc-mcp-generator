@@ -1,303 +1,130 @@
 # rc-mcp-generator
 
-`rc-mcp-generator` exists to solve context bloat for Rocket.Chat MCP deployments. Instead of shipping one oversized server with every Rocket.Chat action enabled, this repo gives you a generator that produces a minimal MCP server containing only the workflows you choose.
+`rc-mcp-generator` is a Gemini CLI extension and deterministic code-generation engine for building minimal Rocket.Chat MCP servers.
 
-It ships as a pnpm monorepo with:
+The generated server is a standalone Node.js project that contains only the workflow tools and OpenAPI operation tools you select. The extension itself exposes discovery, generation, validation, and minimality-analysis tools so the selection process happens inside Gemini CLI without dumping Rocket.Chat's full API surface into every prompt.
 
-- `packages/mcp-server`: the production template server
-- `packages/generator`: the CLI and gemini-cli extension that emits standalone deployable servers
+This is the MVP form of the Rocket.Chat GSoC idea:
 
-[![Deploy on Railway](https://railway.app/button.svg)](https://railway.app/new)
+- official Gemini CLI extension structure at the repo root
+- deterministic generation of standalone MCP servers
+- support for arbitrary OpenAPI operation subsets and curated platform workflows
+- tests emitted with the generated output
+- validation and minimality checks inside the generator product
+
+## Architecture
+
+The repo now has two distinct layers:
+
+- `packages/generator`: the actual product
+  - Gemini CLI extension MCP server over stdio
+  - OpenAPI extraction
+  - endpoint search and suggestion
+  - workflow registry
+  - deterministic server scaffolding
+  - validation and minimality analysis
+- `packages/mcp-server`: reusable generated-server foundation
+  - Rocket.Chat client
+  - Streamable HTTP MCP server
+  - high-level Rocket.Chat workflow tools used as generation templates
+
+## Gemini CLI extension
+
+The root extension manifest is [gemini-extension.json](/home/samar/Projects/rc-mcp-generator/gemini-extension.json). After building, Gemini CLI can load the extension MCP server from:
+
+- [packages/generator/dist/extension-server.js](/home/samar/Projects/rc-mcp-generator/packages/generator/dist/extension-server.js)
+
+Available generator tools:
+
+- `rc_list_workflows`
+- `rc_search_endpoints`
+- `rc_discover_endpoints` with optional tag expansion
+- `rc_suggest_endpoints`
+- `rc_generate_server`
+- `rc_validate_server` with optional deep TypeScript check
+- `rc_analyze_minimality`
 
 ## Quick start
 
 ```bash
 pnpm install
 pnpm build
-pnpm test
-pnpm --filter @rc-mcp-generator/generator dev
-pnpm --filter @rc-mcp-generator/mcp-server start
+gemini extensions link .
+gemini
 ```
 
-## Generator CLI
+Inside Gemini, the intended flow is:
 
-Run the interactive generator:
+1. Use `rc_suggest_endpoints` or `rc_search_endpoints`
+2. Use `rc_discover_endpoints` to browse domains/tags and expand specific tags
+3. Use `rc_list_workflows` if you want platform-level Rocket.Chat operations
+4. Run `rc_generate_server`
+5. Validate with `rc_validate_server`
+6. Check reduction with `rc_analyze_minimality`
+
+## Direct CLI
+
+You can also use the generator without Gemini:
 
 ```bash
-pnpm --filter @rc-mcp-generator/generator dev -- --output ./generated/rc-chat-mcp
+pnpm dev:cli -- list-workflows
+pnpm dev:cli -- search "send messages and search chat"
+pnpm dev:cli -- discover --domains chat,users --expand messaging
+pnpm dev:cli -- suggest "create a support bot that posts announcements and exports history"
+pnpm dev:cli -- generate -o ./generated/my-server -w send_channel_message,post_standup -p searchMessages
+pnpm dev:cli -- validate ./generated/my-server --deep
+pnpm dev:cli -- analyze -p postMessage,searchMessages
 ```
 
-The CLI asks for:
-
-1. `RC_SERVER_URL`
-2. `RC_AUTH_TOKEN`
-3. `RC_USER_ID`
-4. The subset of Rocket.Chat workflows to include
-
-It then generates a standalone folder with:
-
-- only the selected tool files
-- `rc-client.ts`, `server.ts`, `index.ts`, and shared helpers
-- a `.env.example`
-- a production Dockerfile
-- a standalone `package.json`, `tsconfig.json`, ESLint config, and Prettier config
-- Vitest/MSW tests for the selected tools
-- a README with ready-to-use curl examples
-
-## Claude Desktop
-
-Example `claude_desktop_config.json`:
-
-```json
-{
-  "mcpServers": {
-    "rocket-chat": {
-      "command": "node",
-      "args": ["/absolute/path/to/generated-rc-mcp-server/dist/index.js"],
-      "env": {
-        "RC_SERVER_URL": "https://chat.example.com",
-        "RC_AUTH_TOKEN": "your-auth-token",
-        "RC_USER_ID": "your-user-id",
-        "ENABLED_TOOLS": "send_channel_message,post_standup"
-      }
-    }
-  }
-}
-```
-
-## Cursor
-
-Example `.cursorrules` / MCP config snippet:
-
-```json
-{
-  "mcp": {
-    "servers": {
-      "rocket-chat": {
-        "command": "node",
-        "args": ["/absolute/path/to/generated-rc-mcp-server/dist/index.js"],
-        "env": {
-          "RC_SERVER_URL": "https://chat.example.com",
-          "RC_AUTH_TOKEN": "your-auth-token",
-          "RC_USER_ID": "your-user-id",
-          "ENABLED_TOOLS": "send_channel_message,search_messages,export_channel_summary"
-        }
-      }
-    }
-  }
-}
-```
-
-## Workflows
-
-### `send_channel_message`
-
-Purpose: Send a message to a channel by name.
-
-Example input:
-
-```json
-{
-  "channelName": "engineering",
-  "text": "Deploy is complete."
-}
-```
-
-Example output:
-
-```text
-Sent message to #engineering.
-```
-
-### `create_project_room`
-
-Purpose: Create a channel, set its topic, and invite users by username.
-
-Example input:
-
-```json
-{
-  "channelName": "project-atlas",
-  "invitees": ["alice", "bob"],
-  "topic": "Atlas delivery"
-}
-```
-
-Example output:
-
-```text
-Created project room project-atlas.
-```
-
-### `onboard_user`
-
-Purpose: Create a user, add them to default channels, and send a welcome DM.
-
-Example input:
-
-```json
-{
-  "defaultChannels": ["general", "eng"],
-  "email": "new.user@example.com",
-  "name": "New User",
-  "password": "Password123",
-  "username": "new.user",
-  "welcomeMessage": "Welcome aboard."
-}
-```
-
-Example output:
-
-```text
-Onboarded new.user and added them to 2 channels.
-```
-
-### `search_messages`
-
-Purpose: Search messages across accessible rooms or inside one selected channel.
-
-Example input:
-
-```json
-{
-  "channelName": "general",
-  "limit": 10,
-  "query": "deploy"
-}
-```
-
-Example output:
-
-```text
-Found 3 matching messages for "deploy".
-```
-
-### `archive_project_channel`
-
-Purpose: Send a final notice to a room and archive it.
-
-Example input:
-
-```json
-{
-  "channelName": "project-atlas",
-  "notice": "This room is being archived.",
-  "notifyMembers": true
-}
-```
-
-Example output:
-
-```text
-Archived project-atlas.
-```
-
-### `get_user_mentions`
-
-Purpose: Return unread mentions for a specific user.
-
-Example input:
-
-```json
-{
-  "limit": 20,
-  "username": "alice"
-}
-```
-
-Example output:
-
-```text
-Found 2 unread mentions for alice.
-```
-
-### `post_standup`
-
-Purpose: Post a formatted standup entry.
-
-Example input:
-
-```json
-{
-  "blockers": ["Waiting on review"],
-  "channelName": "team-sync",
-  "today": ["Finish API tests"],
-  "username": "alice",
-  "yesterday": ["Built the generator"]
-}
-```
-
-Example output:
-
-```text
-Posted standup update to #team-sync.
-```
-
-### `create_support_ticket`
-
-Purpose: Create a private support room named `ticket-{id}` and add the support team.
-
-Example input:
-
-```json
-{
-  "requesterUsername": "requester",
-  "summary": "Customer cannot access billing.",
-  "supportUsernames": ["support.one", "support.two"],
-  "ticketId": "INC-42"
-}
-```
-
-Example output:
-
-```text
-Created private support ticket room ticket-inc-42.
-```
-
-### `broadcast_announcement`
-
-Purpose: Send the same announcement to multiple channels.
-
-Example input:
-
-```json
-{
-  "channelNames": ["engineering", "product"],
-  "message": "Deployment at 17:00 UTC."
-}
-```
-
-Example output:
-
-```text
-Broadcast announcement to 2 channels.
-```
-
-### `export_channel_summary`
-
-Purpose: Fetch the last N channel messages and return a readable summary.
-
-Example input:
-
-```json
-{
-  "channelName": "general",
-  "limit": 15
-}
-```
-
-Example output:
-
-```text
-Recent summary for general.
-```
-
-## gemini-cli extension
-
-The generator package also includes a gemini-cli extension:
-
-- Manifest: `packages/generator/src/gemini-extension/extension.json`
-- Entry point: `packages/generator/src/gemini-extension/index.ts`
-- Slash command: `/generate-rc-mcp`
-
-The slash command launches the same interactive workflow as the standalone CLI.
+## Generated server output
+
+`rc_generate_server` produces a standalone project with:
+
+- `src/server.ts`
+- `src/rc-client.ts`
+- `src/tools/*.ts`
+- `tests/*.test.ts`
+- `.env` and `.env.example`
+- `README.md`
+- `GEMINI.md`
+- `gemini-extension.json`
+- `Dockerfile`
+
+The generated server is deployable independently and uses env-based pre-authentication:
+
+- `RC_SERVER_URL`
+- `RC_AUTH_TOKEN`
+- `RC_USER_ID`
+- `PORT`
+- `ENABLED_TOOLS`
+
+## Current Rocket.Chat workflows
+
+The workflow registry currently includes 10 platform-level operations:
+
+- `send_channel_message`
+- `create_project_room`
+- `onboard_user`
+- `search_messages`
+- `archive_project_channel`
+- `get_user_mentions`
+- `post_standup`
+- `create_support_ticket`
+- `broadcast_announcement`
+- `export_channel_summary`
+
+## Validation
+
+Workspace validation currently passes:
+
+- `pnpm typecheck`
+- `pnpm build`
+- `pnpm test`
+
+The generated server path has also been validated previously against a live local Rocket.Chat instance, and the MCP server output is usable from MCP Inspector. The generator-side validator now checks:
+
+- required project structure
+- MCP/Zod dependencies
+- one test file per generated tool
+- presence of a Zod object input schema in each generated tool
+- optional `npx tsc --noEmit` deep validation
