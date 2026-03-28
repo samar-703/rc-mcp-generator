@@ -1,6 +1,0 @@
-{
-  "name": "rc-mcp-generator",
-  "version": "1.0.0",
-  "description": "Interactive gemini-cli extension for generating minimal Rocket.Chat MCP servers.",
-  "main": "./index.js"
-}
