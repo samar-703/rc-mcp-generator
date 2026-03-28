@@ -1,36 +1,78 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import os from 'node:os';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import fsNative from 'node:fs';
 
 import fs from 'fs-extra';
 import Handlebars from 'handlebars';
 
-import {
-  AVAILABLE_WORKFLOWS,
-  GENERATED_SERVER_NAME,
-  WORKFLOW_MAP,
-  type WorkflowMetadata,
-  type WorkflowName,
-} from './constants.js';
+import { analyzeMinimality } from './core/minimality-analyzer.js';
+import { ROCKET_CHAT_PROVIDER } from './core/provider-config.js';
+import { SchemaExtractor } from './core/schema-extractor.js';
+import type {
+  EndpointParameter,
+  EndpointSchema,
+  GeneratedToolDescriptor,
+  JsonSchema,
+  MinimalityReport,
+  ProviderConfig,
+  ValidationSummary,
+  WorkflowDefinition,
+} from './core/types.js';
+import { validateGeneratedServer } from './core/validator.js';
+import { resolveWorkflows } from './core/workflow-registry.js';
+
+const execFileAsync = promisify(execFile);
 
 export interface GeneratorConfig {
-  authToken: string;
+  installDependencies?: boolean;
+  operationIds?: string[];
   outputDirectory: string;
-  selectedWorkflows: WorkflowName[];
-  serverUrl: string;
-  userId: string;
+  provider?: ProviderConfig;
+  rcAuthToken?: string;
+  rcServerUrl?: string;
+  rcUserId?: string;
+  registerWithGemini?: boolean;
+  serverName?: string;
+  workflows?: string[];
 }
 
 export interface GeneratedProject {
+  endpoints: EndpointSchema[];
+  generatedTools: GeneratedToolDescriptor[];
+  minimalityReport: MinimalityReport;
   outputDirectory: string;
-  selectedWorkflows: WorkflowMetadata[];
+  validation: ValidationSummary;
+  workflows: WorkflowDefinition[];
 }
 
 const currentFilePath = fileURLToPath(import.meta.url);
 const generatorPackageRoot = path.resolve(path.dirname(currentFilePath), '..');
-const templatesRoot = path.resolve(generatorPackageRoot, 'src', 'templates');
-const mcpServerRoot = path.resolve(generatorPackageRoot, '..', 'mcp-server');
+const templatesRootCandidates = [
+  path.resolve(process.cwd(), 'packages', 'generator', 'src', 'templates'),
+  path.resolve(process.cwd(), 'src', 'templates'),
+  path.resolve(generatorPackageRoot, 'src', 'templates'),
+];
+const mcpServerRootCandidates = [
+  path.resolve(process.cwd(), 'packages', 'mcp-server'),
+  path.resolve(process.cwd(), '..', 'mcp-server'),
+  path.resolve(generatorPackageRoot, '..', 'mcp-server'),
+];
+const lastTemplatesRootCandidate = templatesRootCandidates[templatesRootCandidates.length - 1]!;
+const lastMcpServerRootCandidate = mcpServerRootCandidates[mcpServerRootCandidates.length - 1]!;
+const templatesRoot =
+  templatesRootCandidates.find((candidate) => fsNative.existsSync(candidate)) ??
+  lastTemplatesRootCandidate;
+const mcpServerRoot =
+  mcpServerRootCandidates.find((candidate) => fsNative.existsSync(candidate)) ??
+  lastMcpServerRootCandidate;
 
 const stableJson = (value: unknown): string => `${JSON.stringify(value, null, 2)}\n`;
+
+const sanitizeName = (value: string): string =>
+  value.trim().toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '');
 
 const renderTemplate = async (
   templatePath: string,
@@ -42,9 +84,8 @@ const renderTemplate = async (
 
 const ensureFreshOutputDirectory = async (targetDirectory: string): Promise<string> => {
   const absoluteTargetDirectory = path.resolve(targetDirectory);
-  const exists = await fs.pathExists(absoluteTargetDirectory);
 
-  if (!exists) {
+  if (!(await fs.pathExists(absoluteTargetDirectory))) {
     return absoluteTargetDirectory;
   }
 
@@ -59,33 +100,250 @@ const ensureFreshOutputDirectory = async (targetDirectory: string): Promise<stri
   return candidate;
 };
 
-const resolveSelectedWorkflows = (
-  selectedWorkflows: WorkflowName[],
-): WorkflowMetadata[] =>
-  selectedWorkflows.map((workflowName) => {
-    const workflow = WORKFLOW_MAP.get(workflowName);
+const createZodSchema = (schema: JsonSchema | undefined): string => {
+  if (!schema) {
+    return 'z.any()';
+  }
 
-    if (!workflow) {
-      throw new Error(`Unknown workflow: ${workflowName}`);
+  if (schema.oneOf && schema.oneOf.length > 0) {
+    return `z.union([${schema.oneOf.map((value) => createZodSchema(value)).join(', ')}])`;
+  }
+
+  if (schema.anyOf && schema.anyOf.length > 0) {
+    return `z.union([${schema.anyOf.map((value) => createZodSchema(value)).join(', ')}])`;
+  }
+
+  let baseSchema = 'z.any()';
+
+  switch (schema.type) {
+    case 'array':
+      baseSchema = `z.array(${createZodSchema(schema.items)})`;
+      break;
+    case 'boolean':
+      baseSchema = 'z.boolean()';
+      break;
+    case 'integer':
+    case 'number':
+      baseSchema = 'z.number()';
+      break;
+    case 'object': {
+      const properties = Object.entries(schema.properties ?? {})
+        .map(([propertyName, propertySchema]) => {
+          const isRequired = schema.required?.includes(propertyName) ?? false;
+          const propertyZod = createZodSchema(propertySchema);
+          return `  ${JSON.stringify(propertyName)}: ${isRequired ? propertyZod : `${propertyZod}.optional()`},`;
+        })
+        .join('\n');
+      const objectSchema = `z.object({\n${properties}\n})`;
+
+      if (schema.additionalProperties === true) {
+        baseSchema = `${objectSchema}.passthrough()`;
+      } else if (schema.additionalProperties && typeof schema.additionalProperties === 'object') {
+        baseSchema = `${objectSchema}.catchall(${createZodSchema(schema.additionalProperties)})`;
+      } else {
+        baseSchema = objectSchema;
+      }
+      break;
     }
+    case 'string':
+      if (schema.enum && schema.enum.length > 0) {
+        baseSchema = `z.enum([${schema.enum.map((value) => JSON.stringify(String(value))).join(', ')}])`;
+      } else {
+        baseSchema = 'z.string()';
+      }
+      break;
+    default:
+      if (schema.enum && schema.enum.length > 0) {
+        baseSchema = `z.enum([${schema.enum.map((value) => JSON.stringify(String(value))).join(', ')}])`;
+      }
+  }
 
-    return workflow;
+  if (schema.nullable) {
+    return `${baseSchema}.nullable()`;
+  }
+
+  return baseSchema;
+};
+
+const createExampleValue = (schema: JsonSchema | undefined): unknown => {
+  if (!schema) {
+    return 'value';
+  }
+
+  if (schema.oneOf && schema.oneOf.length > 0) {
+    return createExampleValue(schema.oneOf[0]);
+  }
+
+  if (schema.anyOf && schema.anyOf.length > 0) {
+    return createExampleValue(schema.anyOf[0]);
+  }
+
+  switch (schema.type) {
+    case 'array':
+      return [createExampleValue(schema.items)];
+    case 'boolean':
+      return true;
+    case 'integer':
+    case 'number':
+      return 1;
+    case 'object':
+      return Object.fromEntries(
+        Object.entries(schema.properties ?? {}).map(([propertyName, propertySchema]) => [
+          propertyName,
+          createExampleValue(propertySchema),
+        ]),
+      );
+    case 'string':
+      return typeof schema.default === 'string'
+        ? schema.default
+        : Array.isArray(schema.enum) && schema.enum.length > 0
+          ? schema.enum[0]
+          : 'value';
+    default:
+      return 'value';
+  }
+};
+
+const pathParams = (parameters: EndpointParameter[]): EndpointParameter[] =>
+  parameters.filter((parameter) => parameter.in === 'path');
+
+const queryParams = (parameters: EndpointParameter[]): EndpointParameter[] =>
+  parameters.filter((parameter) => parameter.in === 'query');
+
+const createEndpointInputSchema = (endpoint: EndpointSchema): string => {
+  const fields = [
+    ...pathParams(endpoint.parameters),
+    ...queryParams(endpoint.parameters),
+    ...(endpoint.requestBody
+      ? [
+          {
+            description: 'Request body',
+            in: 'query' as const,
+            name: 'body',
+            required: true,
+            schema: endpoint.requestBody,
+          },
+        ]
+      : []),
+  ]
+    .map((parameter) => {
+      const zodSchema = createZodSchema(parameter.schema);
+      return `  ${JSON.stringify(parameter.name)}: ${
+        parameter.required ? zodSchema : `${zodSchema}.optional()`
+      },`;
+    })
+    .join('\n');
+
+  return `z.object({\n${fields}\n})`;
+};
+
+const renderEndpointToolSource = (endpoint: EndpointSchema): string => {
+  const inputSchemaName = `${endpoint.toolName}InputSchema`;
+  const responseSchemaName = `${endpoint.toolName}ResponseSchema`;
+  const pathParamNames = stableJson(pathParams(endpoint.parameters).map((parameter) => parameter.name)).trim();
+  const queryParamNames = stableJson(queryParams(endpoint.parameters).map((parameter) => parameter.name)).trim();
+  const responseSchema = createZodSchema(endpoint.responseBody);
+
+  return `import { z } from 'zod';
+
+import { createErrorResult, createTextResult } from '../tool-utils.js';
+import type { ToolDefinition, ToolHandler } from '../types.js';
+
+export const ${inputSchemaName} = ${createEndpointInputSchema(endpoint)};
+export const ${responseSchemaName} = ${responseSchema};
+
+const PATH_PARAM_NAMES = ${pathParamNames} as const;
+const QUERY_PARAM_NAMES = ${queryParamNames} as const;
+
+const compilePath = (templatePath: string, input: Record<string, unknown>): string =>
+  PATH_PARAM_NAMES.reduce(
+    (resolvedPath, parameterName) =>
+      resolvedPath.replace(\`{\${parameterName}}\`, encodeURIComponent(String(input[parameterName]))),
+    templatePath,
+  );
+
+export const toolDefinition: ToolDefinition<typeof ${inputSchemaName}> = {
+  description: ${JSON.stringify(endpoint.description || endpoint.summary)},
+  inputSchema: ${inputSchemaName},
+  name: ${JSON.stringify(endpoint.toolName)},
+};
+
+export const toolHandler: ToolHandler<typeof ${inputSchemaName}> = async (input, { client }) => {
+  try {
+    const query = Object.fromEntries(
+      QUERY_PARAM_NAMES
+        .filter((parameterName) => input[parameterName] !== undefined)
+        .map((parameterName) => [parameterName, input[parameterName]]),
+    );
+    const response = await client.callApi(
+      {
+        data: 'body' in input ? input.body : undefined,
+        method: ${JSON.stringify(endpoint.method.toUpperCase())},
+        params: Object.keys(query).length > 0 ? query : undefined,
+        url: compilePath(${JSON.stringify(endpoint.path)}, input as Record<string, unknown>),
+      },
+      ${responseSchemaName},
+    );
+
+    return createTextResult(
+      ${JSON.stringify(`Executed ${endpoint.operationId}.`)},
+      response as Record<string, unknown>,
+    );
+  } catch (error) {
+    return createErrorResult(${JSON.stringify(`Failed to execute ${endpoint.operationId}`)}, error);
+  }
+};
+`;
+};
+
+const renderEndpointToolTest = (endpoint: EndpointSchema): string => {
+  const inputSchemaName = `${endpoint.toolName}InputSchema`;
+  const validInput = Object.fromEntries([
+    ...pathParams(endpoint.parameters).map((parameter) => [
+      parameter.name,
+      createExampleValue(parameter.schema),
+    ]),
+    ...queryParams(endpoint.parameters).map((parameter) => [
+      parameter.name,
+      createExampleValue(parameter.schema),
+    ]),
+    ...(endpoint.requestBody ? [['body', createExampleValue(endpoint.requestBody)]] : []),
+  ]);
+
+  return `import { describe, expect, it, vi } from 'vitest';
+
+import { toolDefinition, toolHandler, ${inputSchemaName} } from '../src/tools/${endpoint.toolName}.js';
+
+describe(${JSON.stringify(endpoint.toolName)}, () => {
+  it('exposes a zod input schema and calls the Rocket.Chat client', async () => {
+    const callApi = vi.fn().mockResolvedValue({ success: true });
+    const result = await toolHandler(
+      ${JSON.stringify(validInput, null, 2)},
+      { client: { callApi } } as never,
+    );
+
+    expect(toolDefinition.name).toBe(${JSON.stringify(endpoint.toolName)});
+    expect(${inputSchemaName}.safeParse(${JSON.stringify(validInput, null, 2)}).success).toBe(true);
+    expect(callApi).toHaveBeenCalledOnce();
+    expect(result.isError).toBeUndefined();
   });
+});
+`;
+};
 
-const renderConstantsFile = (selectedWorkflows: WorkflowMetadata[]): string => {
-  const toolMetadata = selectedWorkflows.reduce<Record<string, { description: string; fileName: string }>>(
-    (accumulator, workflow) => {
-      accumulator[workflow.name] = {
-        description: workflow.description,
-        fileName: workflow.fileName,
+const renderConstantsFile = (generatedTools: GeneratedToolDescriptor[]): string => {
+  const toolMetadata = generatedTools.reduce<Record<string, { description: string; fileName: string }>>(
+    (accumulator, tool) => {
+      accumulator[tool.name] = {
+        description: tool.description,
+        fileName: tool.fileName,
       };
-
       return accumulator;
     },
     {},
   );
 
-  return `export const PACKAGE_NAME = '${GENERATED_SERVER_NAME}';
+  return `export const PACKAGE_NAME = 'generated-rc-mcp-server';
 export const SERVER_NAME = 'rc-mcp-server';
 export const SERVER_VERSION = '1.0.0';
 export const DEFAULT_PORT = 3000;
@@ -147,14 +405,11 @@ export const ALL_TOOL_NAMES = Object.keys(TOOL_METADATA) as ToolName[];
 `;
 };
 
-const renderToolRegistryFile = (selectedWorkflows: WorkflowMetadata[]): string => {
-  const imports = selectedWorkflows
-    .map(
-      (workflow) =>
-        `import * as ${workflow.fileName} from './tools/${workflow.fileName}.js';`,
-    )
+const renderToolRegistryFile = (generatedTools: GeneratedToolDescriptor[]): string => {
+  const imports = generatedTools
+    .map((tool) => `import * as ${tool.fileName} from './tools/${tool.fileName}.js';`)
     .join('\n');
-  const registry = selectedWorkflows.map((workflow) => workflow.fileName).join(',\n  ');
+  const registry = generatedTools.map((tool) => tool.fileName).join(',\n  ');
 
   return `import type { ToolModule } from './types.js';
 
@@ -166,9 +421,9 @@ export const ALL_TOOL_MODULES: ToolModule[] = [
 `;
 };
 
-const renderPackageJson = (): string =>
+const renderPackageJson = (serverName: string): string =>
   stableJson({
-    name: GENERATED_SERVER_NAME,
+    name: sanitizeName(serverName),
     private: true,
     type: 'module',
     version: '1.0.0',
@@ -181,7 +436,7 @@ const renderPackageJson = (): string =>
       typecheck: 'tsc --project tsconfig.json --noEmit',
     },
     dependencies: {
-      '@modelcontextprotocol/sdk': '^1.17.0',
+      '@modelcontextprotocol/sdk': '^1.27.1',
       axios: '^1.11.0',
       dotenv: '^17.2.2',
       zod: '^4.1.5',
@@ -240,11 +495,6 @@ module.exports = tseslint.config(
         tsconfigRootDir: __dirname,
       },
     },
-    rules: {
-      '@typescript-eslint/consistent-type-imports': 'error',
-      '@typescript-eslint/no-floating-promises': 'error',
-      '@typescript-eslint/no-misused-promises': 'error',
-    },
   },
 );
 `;
@@ -262,10 +512,10 @@ node_modules
 .env
 `;
 
-const renderEnvExample = (config: GeneratorConfig): string => `RC_SERVER_URL=${config.serverUrl}
-RC_AUTH_TOKEN=${config.authToken}
-RC_USER_ID=${config.userId}
-ENABLED_TOOLS=${config.selectedWorkflows.join(',')}
+const renderEnvExample = (config: GeneratorConfig): string => `RC_SERVER_URL=${config.rcServerUrl ?? 'http://localhost:3000'}
+RC_AUTH_TOKEN=${config.rcAuthToken ?? 'YOUR_TOKEN_HERE'}
+RC_USER_ID=${config.rcUserId ?? 'YOUR_USERID_HERE'}
+ENABLED_TOOLS=
 PORT=3000
 `;
 
@@ -278,47 +528,59 @@ EXPOSE 3000
 CMD ["node", "dist/index.js"]
 `;
 
-const renderCurlExample = (workflow: WorkflowMetadata): string => `\`\`\`bash
-curl -X POST http://localhost:3000/mcp \\
-  -H "Content-Type: application/json" \\
-  -H "Mcp-Session-Id: <SESSION_ID>" \\
-  -d '{
-    "jsonrpc": "2.0",
-    "id": "${workflow.name}",
-    "method": "tools/call",
-    "params": {
-      "name": "${workflow.name}",
-      "arguments": ${JSON.stringify(workflow.exampleArgs, null, 8).replace(/\n/g, '\n      ')}
-    }
-  }'
-\`\`\``;
+const renderGeneratedExtensionManifest = (serverName: string): string =>
+  stableJson({
+    contextFileName: 'GEMINI.md',
+    mcpServers: {
+      [sanitizeName(serverName)]: {
+        args: ['${extensionPath}${/}dist${/}index.js'],
+        command: 'node',
+        cwd: '${extensionPath}',
+      },
+    },
+    name: sanitizeName(serverName),
+    version: '1.0.0',
+  });
 
-const renderReadme = (selectedWorkflows: WorkflowMetadata[]): string => {
-  const workflowSections = selectedWorkflows
+const renderGeneratedGeminiContext = (
+  serverName: string,
+  generatedTools: GeneratedToolDescriptor[],
+): string => `Use the ${serverName} MCP server for Rocket.Chat operations.
+
+Available tools:
+${generatedTools.map((tool) => `- ${tool.name}: ${tool.description}`).join('\n')}
+`;
+
+const renderReadme = (
+  serverName: string,
+  workflows: WorkflowDefinition[],
+  endpoints: EndpointSchema[],
+): string => {
+  const workflowSection = workflows
     .map(
       (workflow) => `### \`${workflow.name}\`
 
 ${workflow.description}
 
-Example input:
 \`\`\`json
 ${JSON.stringify(workflow.exampleArgs, null, 2)}
 \`\`\`
-
-Example output summary:
-\`\`\`text
-${workflow.exampleResultSummary}
-\`\`\`
-
-Curl example:
-${renderCurlExample(workflow)}
 `,
     )
     .join('\n');
+  const endpointSection = endpoints
+    .map(
+      (endpoint) => `- \`${endpoint.toolName}\` → \`${endpoint.method.toUpperCase()} ${endpoint.path}\` (${endpoint.operationId})`,
+    )
+    .join('\n');
 
-  return `# ${GENERATED_SERVER_NAME}
+  return `# ${serverName}
 
-This is a generated minimal Rocket.Chat MCP server. It exists to avoid context bloat: instead of handing a general-purpose assistant a giant server with every Rocket.Chat action, you deploy only the workflows you actually need.
+This standalone Rocket.Chat MCP server was generated by rc-mcp-generator. It contains only the workflows and endpoint tools selected for your project, reducing context bloat for agentic coding workflows.
+
+## Why this exists
+
+Traditional MCP servers expose a large static catalog of tools on every prompt. This generated server keeps only the Rocket.Chat capabilities your project actually needs, which reduces token waste, lowers tool confusion, and makes agentic loops cheaper and more reliable.
 
 ## Quick start
 
@@ -326,36 +588,34 @@ This is a generated minimal Rocket.Chat MCP server. It exists to avoid context b
 npm install
 cp .env.example .env
 npm run build
-npm run test
+npm test
 npm start
 \`\`\`
 
-## Included workflows
+## Environment
 
-${selectedWorkflows.map((workflow) => `- \`${workflow.name}\` - ${workflow.description}`).join('\n')}
+- \`RC_SERVER_URL\`
+- \`RC_AUTH_TOKEN\`
+- \`RC_USER_ID\`
+- \`PORT\`
+- \`ENABLED_TOOLS\`
 
-## MCP bootstrap
+## Included workflow tools
 
-Initialize once to get an \`Mcp-Session-Id\` header, then use that session for tool calls:
+${workflowSection || 'No workflow tools selected.'}
+
+## Included endpoint tools
+
+${endpointSection || 'No direct endpoint tools selected.'}
+
+## Gemini CLI
+
+This project ships with \`gemini-extension.json\` and \`GEMINI.md\`, so it can be linked as a Gemini CLI extension after build:
 
 \`\`\`bash
-curl -i -X POST http://localhost:3000/mcp \\
-  -H "Content-Type: application/json" \\
-  -d '{
-    "jsonrpc": "2.0",
-    "id": "init",
-    "method": "initialize",
-    "params": {
-      "protocolVersion": "2025-03-26",
-      "capabilities": {},
-      "clientInfo": { "name": "curl", "version": "1.0.0" }
-    }
-  }'
+npm run build
+gemini extensions link .
 \`\`\`
-
-## Workflow examples
-
-${workflowSections}
 `;
 };
 
@@ -366,32 +626,91 @@ const copySharedFile = async (
 ): Promise<void> => {
   const sourcePath = path.resolve(mcpServerRoot, sourceRelativePath);
   const destinationPath = path.resolve(destinationDirectory, destinationRelativePath);
-
   await fs.ensureDir(path.dirname(destinationPath));
   await fs.copyFile(sourcePath, destinationPath);
 };
 
 const renderWorkflowTemplate = async (
-  category: 'tools' | 'tests',
-  workflow: WorkflowMetadata,
+  kind: 'test' | 'tool',
+  workflow: WorkflowDefinition,
 ): Promise<string> => {
-  const templatePath = path.resolve(templatesRoot, category, `${workflow.fileName}.${category === 'tools' ? 'ts' : 'test.ts'}.hbs`);
-  const sourcePath = path.resolve(
-    mcpServerRoot,
-    category === 'tools'
-      ? path.join('src', 'tools', `${workflow.fileName}.ts`)
-      : path.join('tests', `${workflow.fileName}.test.ts`),
+  const source = await fs.readFile(
+    kind === 'tool' ? workflow.sourceToolFile : workflow.sourceTestFile,
+    'utf8',
   );
-  const source = await fs.readFile(sourcePath, 'utf8');
+  const templatePath = path.resolve(
+    templatesRoot,
+    kind === 'tool' ? 'tools' : 'tests',
+    `${workflow.name}.${kind === 'tool' ? 'ts' : 'test.ts'}.hbs`,
+  );
 
   return renderTemplate(templatePath, { source });
+};
+
+const createGeneratedToolDescriptors = (
+  workflows: WorkflowDefinition[],
+  endpoints: EndpointSchema[],
+): GeneratedToolDescriptor[] => [
+  ...workflows.map((workflow) => ({
+    description: workflow.description,
+    fileName: workflow.name,
+    name: workflow.name,
+    testFileName: `${workflow.name}.test.ts`,
+    type: 'workflow' as const,
+  })),
+  ...endpoints.map((endpoint) => ({
+    description: endpoint.description || endpoint.summary,
+    fileName: endpoint.toolName,
+    name: endpoint.toolName,
+    testFileName: `${endpoint.toolName}.test.ts`,
+    type: 'endpoint' as const,
+  })),
+];
+
+const registerWithGemini = async (
+  serverDir: string,
+  serverName: string,
+): Promise<void> => {
+  const settingsPath = path.resolve(os.homedir(), '.gemini', 'settings.json');
+  const settings = (await fs.pathExists(settingsPath))
+    ? ((await fs.readJson(settingsPath)) as Record<string, unknown>)
+    : {};
+  const mcpServers = ((settings.mcpServers as Record<string, unknown> | undefined) ?? {});
+
+  mcpServers[sanitizeName(serverName)] = {
+    args: [path.resolve(serverDir, 'dist', 'index.js')],
+    command: 'node',
+  };
+
+  await fs.ensureDir(path.dirname(settingsPath));
+  await fs.writeJson(
+    settingsPath,
+    {
+      ...settings,
+      mcpServers,
+    },
+    { spaces: 2 },
+  );
+};
+
+const installAndBuildGeneratedServer = async (serverDir: string): Promise<void> => {
+  await execFileAsync('npm', ['install'], { cwd: serverDir });
+  await execFileAsync('npm', ['run', 'build'], { cwd: serverDir });
 };
 
 export const generateProject = async (
   config: GeneratorConfig,
 ): Promise<GeneratedProject> => {
-  const selectedWorkflows = resolveSelectedWorkflows(config.selectedWorkflows);
+  const provider = config.provider ?? ROCKET_CHAT_PROVIDER;
+  const schemaExtractor = new SchemaExtractor(provider);
+  const selectedEndpoints =
+    config.operationIds && config.operationIds.length > 0
+      ? await schemaExtractor.getEndpointsByOperationId(config.operationIds)
+      : [];
+  const selectedWorkflows = resolveWorkflows(config.workflows ?? []);
   const outputDirectory = await ensureFreshOutputDirectory(config.outputDirectory);
+  const generatedTools = createGeneratedToolDescriptors(selectedWorkflows, selectedEndpoints);
+  const serverName = config.serverName ?? 'generated-rc-mcp-server';
 
   await fs.ensureDir(path.resolve(outputDirectory, 'src', 'tools'));
   await fs.ensureDir(path.resolve(outputDirectory, 'tests'));
@@ -412,38 +731,87 @@ export const generateProject = async (
 
   await fs.writeFile(
     path.resolve(outputDirectory, 'src', 'constants.ts'),
-    renderConstantsFile(selectedWorkflows),
+    renderConstantsFile(generatedTools),
   );
   await fs.writeFile(
     path.resolve(outputDirectory, 'src', 'tool-registry.ts'),
-    renderToolRegistryFile(selectedWorkflows),
+    renderToolRegistryFile(generatedTools),
   );
 
   for (const workflow of selectedWorkflows) {
-    const renderedToolSource = await renderWorkflowTemplate('tools', workflow);
-    const renderedTestSource = await renderWorkflowTemplate('tests', workflow);
-
     await fs.writeFile(
-      path.resolve(outputDirectory, 'src', 'tools', `${workflow.fileName}.ts`),
-      renderedToolSource,
+      path.resolve(outputDirectory, 'src', 'tools', `${workflow.name}.ts`),
+      await renderWorkflowTemplate('tool', workflow),
     );
     await fs.writeFile(
-      path.resolve(outputDirectory, 'tests', `${workflow.fileName}.test.ts`),
-      renderedTestSource,
+      path.resolve(outputDirectory, 'tests', `${workflow.name}.test.ts`),
+      await renderWorkflowTemplate('test', workflow),
     );
   }
 
-  await fs.writeFile(path.resolve(outputDirectory, 'package.json'), renderPackageJson());
+  for (const endpoint of selectedEndpoints) {
+    await fs.writeFile(
+      path.resolve(outputDirectory, 'src', 'tools', `${endpoint.toolName}.ts`),
+      renderEndpointToolSource(endpoint),
+    );
+    await fs.writeFile(
+      path.resolve(outputDirectory, 'tests', `${endpoint.toolName}.test.ts`),
+      renderEndpointToolTest(endpoint),
+    );
+  }
+
+  await fs.writeFile(path.resolve(outputDirectory, 'package.json'), renderPackageJson(serverName));
   await fs.writeFile(path.resolve(outputDirectory, 'tsconfig.json'), renderTsConfig());
   await fs.writeFile(path.resolve(outputDirectory, '.env.example'), renderEnvExample(config));
+  await fs.writeFile(path.resolve(outputDirectory, '.env'), renderEnvExample(config));
   await fs.writeFile(path.resolve(outputDirectory, 'Dockerfile'), renderDockerfile());
-  await fs.writeFile(path.resolve(outputDirectory, 'README.md'), renderReadme(selectedWorkflows));
+  await fs.writeFile(
+    path.resolve(outputDirectory, 'README.md'),
+    renderReadme(serverName, selectedWorkflows, selectedEndpoints),
+  );
+  await fs.writeFile(path.resolve(outputDirectory, 'GEMINI.md'), renderGeneratedGeminiContext(serverName, generatedTools));
+  await fs.writeFile(
+    path.resolve(outputDirectory, 'gemini-extension.json'),
+    renderGeneratedExtensionManifest(serverName),
+  );
   await fs.writeFile(path.resolve(outputDirectory, 'eslint.config.js'), renderEslintConfig());
   await fs.writeFile(path.resolve(outputDirectory, '.gitignore'), renderGitignore());
   await fs.writeFile(path.resolve(outputDirectory, '.prettierrc.json'), renderPrettierConfig());
 
+  if (config.installDependencies) {
+    await installAndBuildGeneratedServer(outputDirectory);
+  }
+
+  if (config.registerWithGemini) {
+    await registerWithGemini(outputDirectory, serverName);
+  }
+
+  const validation = await validateGeneratedServer(outputDirectory, {
+    deep: Boolean(config.installDependencies),
+  });
+  const fullEndpointCatalog = await schemaExtractor.getEndpoints();
+  const minimalityReport = analyzeMinimality(fullEndpointCatalog, selectedEndpoints);
+
   return {
+    endpoints: selectedEndpoints,
+    generatedTools,
+    minimalityReport,
     outputDirectory,
-    selectedWorkflows,
+    validation,
+    workflows: selectedWorkflows,
   };
+};
+
+export const validateServer = validateGeneratedServer;
+export const analyzeMinimalityForOperationIds = async (
+  operationIds: string[],
+  provider: ProviderConfig = ROCKET_CHAT_PROVIDER,
+): Promise<MinimalityReport> => {
+  const extractor = new SchemaExtractor(provider);
+  const [allEndpoints, selectedEndpoints] = await Promise.all([
+    extractor.getEndpoints(),
+    extractor.getEndpointsByOperationId(operationIds),
+  ]);
+
+  return analyzeMinimality(allEndpoints, selectedEndpoints);
 };
